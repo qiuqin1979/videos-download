@@ -6,6 +6,16 @@
 
 ---
 
+## 2026-08-07 初始化 Git 仓库并推送
+
+- **仓库地址**：https://github.com/qiuqin1979/videos-download.git
+- **分支**：main
+- **提交**：`b60d498` Initial commit
+- **包含文件**：video_download.py, start.bat, start.vbs, run.bat, export_cookies.py, requirements.txt, CHANGELOG.md, README.md, .gitignore
+- **排除文件**（.gitignore）：downloads/ 等视频目录、cookies.txt、.video_downloader_settings.json、__pycache__/、*.part 等
+
+---
+
 ## 2026-08-07 (本次会话)
 
 ### 1. 修复下载无声音问题
