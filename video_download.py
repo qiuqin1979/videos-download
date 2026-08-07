@@ -22,7 +22,7 @@ class VideoDownloader:
     def __init__(self, root):
         self.root = root
         self.root.title("Video Downloader")
-        self.root.geometry("700x640")
+        self.root.geometry("700x720")
         self.root.resizable(True, True)
         self.root.configure(bg="#1e1e2e")
 
@@ -118,6 +118,55 @@ class VideoDownloader:
         ttk.Label(proxy_row, text="  (格式: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080)",
                   foreground="#a6adc8", font=("Segoe UI", 9)).pack(side="left")
 
+        # --- Download mode (how to parallelise) + concurrency options ---
+        frame_dlmode = tk.LabelFrame(self.root, text="下载加速", bg=bg, fg=accent,
+                                     font=("Segoe UI", 10, "bold"), padx=10, pady=6)
+        frame_dlmode.pack(fill="x", padx=15, pady=(8, 2))
+
+        mode_row = tk.Frame(frame_dlmode, bg=bg)
+        mode_row.pack(fill="x", pady=2)
+        ttk.Label(mode_row, text="下载模式:").pack(side="left")
+        self.dl_mode_var = tk.StringVar(value="sequential")
+        self.combo_dlmode = ttk.Combobox(mode_row, textvariable=self.dl_mode_var,
+                                         state="readonly", width=36, font=("Segoe UI", 10))
+        self.combo_dlmode["values"] = [
+            "顺序下载（稳定，不开启加速）",
+            "单文件分片多线程（并发下载一个视频的多个分片）",
+            "多文件并行下载（同时下载多个视频文件）",
+        ]
+        self.combo_dlmode.pack(side="left", padx=(6, 12))
+        self.combo_dlmode.bind("<<ComboboxSelected>>", self._on_dl_mode_change)
+
+        # Fragment concurrency (for mode "concurrent-fragments")
+        self.frag_frame = tk.Frame(frame_dlmode, bg=bg)
+        ttk.Label(self.frag_frame, text="分片并发数:").pack(side="left")
+        self.frag_concurrency_var = tk.IntVar(value=4)
+        sp_frag = tk.Spinbox(self.frag_frame, from_=2, to=32, width=5,
+                            textvariable=self.frag_concurrency_var,
+                            font=("Segoe UI", 10),
+                            bg=entry_bg, fg=fg, relief="flat",
+                            buttonbackground=btn_bg, buttonforeground=fg)
+        sp_frag.pack(side="left", padx=(6, 10))
+        ttk.Label(self.frag_frame, text="  (默认 4，YouTube 建议 4-8，过高会触发限流)",
+                  foreground="#a6adc8", font=("Segoe UI", 9)).pack(side="left")
+
+        # Multi-file parallelism (for mode "multi-file")
+        self.multifile_frame = tk.Frame(frame_dlmode, bg=bg)
+        ttk.Label(self.multifile_frame, text="并行文件数:").pack(side="left")
+        self.file_concurrency_var = tk.IntVar(value=3)
+        sp_file = tk.Spinbox(self.multifile_frame, from_=2, to=16, width=5,
+                            textvariable=self.file_concurrency_var,
+                            font=("Segoe UI", 10),
+                            bg=entry_bg, fg=fg, relief="flat",
+                            buttonbackground=btn_bg, buttonforeground=fg)
+        sp_file.pack(side="left", padx=(6, 10))
+        ttk.Label(self.multifile_frame, text="  (默认 3，同时下载 N 个视频，占 N 份带宽)",
+                  foreground="#a6adc8", font=("Segoe UI", 9)).pack(side="left")
+        self.multifile_frame.pack_forget()  # hidden by default
+
+        # Current mode label (initially for default mode)
+        self._on_dl_mode_change()
+
         # Fetch qualities button
         self.btn_fetch = ttk.Button(frame_url, text="Fetch Available Qualities", command=self._fetch_formats)
         self.btn_fetch.pack(anchor="e", pady=2)
@@ -197,6 +246,9 @@ class VideoDownloader:
                     self.cookie_file_var, self.proxy_var):
             var.trace_add("write", _schedule_save)
         self.traverse_var.trace_add("write", _schedule_save)
+        self.dl_mode_var.trace_add("write", _schedule_save)
+        self.frag_concurrency_var.trace_add("write", _schedule_save)
+        self.file_concurrency_var.trace_add("write", _schedule_save)
 
     def _collect_settings(self):
         """Return a dict of the current user-editable state."""
@@ -215,6 +267,9 @@ class VideoDownloader:
             "proxy": self.proxy_var.get(),
             "quality_label": qual_label,
             "window_geometry": self.root.geometry(),
+            "dl_mode": self.dl_mode_var.get(),
+            "frag_concurrency": int(self.frag_concurrency_var.get()),
+            "file_concurrency": int(self.file_concurrency_var.get()),
         }
 
     def _save_settings(self):
@@ -255,6 +310,15 @@ class VideoDownloader:
                 self.cookie_file_var.set(data["cookie_file"])
             if isinstance(data.get("proxy"), str):
                 self.proxy_var.set(data["proxy"])
+            if isinstance(data.get("dl_mode"), str) and data["dl_mode"]:
+                # Only restore if still in allowed list (defensive)
+                if data["dl_mode"] in self.combo_dlmode["values"]:
+                    self.dl_mode_var.set(data["dl_mode"])
+                    self._on_dl_mode_change()
+            if isinstance(data.get("frag_concurrency"), int):
+                self.frag_concurrency_var.set(max(2, min(32, data["frag_concurrency"])))
+            if isinstance(data.get("file_concurrency"), int):
+                self.file_concurrency_var.set(max(2, min(16, data["file_concurrency"])))
             # window geometry (restore size/position if recorded)
             geom = data.get("window_geometry")
             if isinstance(geom, str) and "x" in geom:
@@ -312,6 +376,35 @@ class VideoDownloader:
     def _set_status(self, msg):
         self.lbl_status.configure(text=msg)
 
+    def _update_progress(self, pct, speed_str="", eta_str="", total_str=""):
+        """Update the progress bar and status line with speed + ETA info.
+
+        The status line aggregates overall state (how many videos done / total,
+        parallel worker count, etc.) with per-download progress.  This is the
+        single code path that formats the status line so sequential,
+        fragment-parallel and multi-file modes all share the same layout.
+        """
+        self.progress_var.set(pct)
+        parts = [f"下载中 {pct:.1f}%"]
+        if speed_str:
+            parts.append(f"速度 {speed_str}")
+        if eta_str:
+            parts.append(f"剩余 {eta_str}")
+        if total_str:
+            parts.append(f"总量 {total_str}")
+
+        overall_done = getattr(self, "_overall_done_videos", 0)
+        overall_total = getattr(self, "_overall_total_videos", 0)
+        if overall_total and overall_done is not None:
+            parts.append(f"视频 {overall_done}/{overall_total}")
+
+        # Multi-file worker count (set by _download_multi_file).
+        workers = getattr(self, "_active_workers", 0)
+        if workers:
+            parts.append(f"并行 {workers}")
+
+        self._set_status(" | ".join(parts))
+
     def _browse_dir(self):
         d = filedialog.askdirectory(initialdir=self.dir_var.get())
         if d:
@@ -323,6 +416,32 @@ class VideoDownloader:
             self.cookie_file_frame.pack(fill="x", padx=15, pady=(2, 4))
         else:
             self.cookie_file_frame.pack_forget()
+
+    def _on_dl_mode_change(self, _event=None):
+        """Show/hide the fragment / multi-file panels based on the selected download mode."""
+        mode_label = self.dl_mode_var.get() or ""
+        # Default / sequential -> hide both
+        frag_shown = False
+        multi_shown = False
+        if "分片" in mode_label:
+            frag_shown = True
+        elif "多文件" in mode_label:
+            multi_shown = True
+
+        if frag_shown:
+            self.frag_frame.pack(fill="x", pady=(4, 2))
+        else:
+            try:
+                self.frag_frame.pack_forget()
+            except Exception:
+                pass
+        if multi_shown:
+            self.multifile_frame.pack(fill="x", pady=(4, 2))
+        else:
+            try:
+                self.multifile_frame.pack_forget()
+            except Exception:
+                pass
 
     def _browse_cookie_file(self):
         f = filedialog.askopenfilename(
@@ -725,19 +844,46 @@ class VideoDownloader:
         fmt_id = self.formats[idx][1]
 
         traverse = self.traverse_var.get()
+        mode_label = self.dl_mode_var.get() or ""
+        is_frag = "分片" in mode_label
+        is_multi = "多文件" in mode_label
+
+        # Multi-file only makes sense in traverse mode (we need >1 videos)
+        if is_multi and not traverse:
+            messagebox.showinfo(
+                "提示",
+                "多文件并行下载需要勾选「遍历系列视频」。\n"
+                "单视频无法并行拆分多个文件。\n\n"
+                "你可以切换为「单文件分片多线程」模式，或者勾选遍历后重试。"
+            )
+            return
+
         self.downloading = True
         self.btn_download.configure(state="disabled")
         self.progress_var.set(0)
-        self._set_status("Downloading...")
+        # Reset aggregate counters for speed / overall progress display.
+        self._overall_total_videos = 0
+        self._overall_done_videos = 0
+        self._set_status("下载准备中...")
         self._log(f"Starting download: {url}")
         self._log(f"Format: {self.formats[idx][0]}")
         self._log(f"Traverse series: {traverse}")
+        self._log(f"Download mode: {mode_label}")
         self._log(f"Save to: {save_dir}")
 
-        threading.Thread(target=self._download_thread,
-                         args=(url, fmt_id, save_dir, traverse), daemon=True).start()
+        if is_multi and traverse:
+            threading.Thread(target=self._download_multi_file,
+                             args=(url, fmt_id, save_dir), daemon=True).start()
+        else:
+            threading.Thread(target=self._download_thread,
+                             args=(url, fmt_id, save_dir, traverse, is_frag), daemon=True).start()
 
-    def _download_thread(self, url, fmt_id, save_dir, traverse):
+    def _download_thread(self, url, fmt_id, save_dir, traverse, fragment_parallel=False):
+        """Sequential download of one URL (possibly a playlist).
+
+        fragment_parallel: if True, enable --concurrent-fragments N so a single
+                           file's HLS/DASH fragments are downloaded in N threads.
+        """
         try:
             # When traversing a series, prefix filenames with the playlist index
             # (1.标题.mp4, 2.标题.mp4, ...) so episodes stay ordered.
@@ -768,10 +914,14 @@ class VideoDownloader:
                 # bar by default.  --progress forces it to emit progress lines
                 # regardless of output destination.
                 "--progress",
-                # Use a custom progress template so the progress line is
-                # machine-parseable and never clashes with --print markers.
-                # Output format: __PROG__ 45.2
-                "--progress-template", "download:__PROG__ %(progress._percent_str)s",
+                # Custom machine-parseable progress line.  TAB separated so
+                # spaces in human-friendly values (e.g. "2.4 MiB/s") won't
+                # confuse parsing.  Fields: percent | speed_str | eta_str |
+                # downloaded_str | total_str.
+                "--progress-template",
+                "download:__PROG__\t%(progress._percent_str)s\t"
+                "%(progress._speed_str)s\t%(progress._eta_str)s\t"
+                "%(progress._downloaded_bytes_str)s\t%(progress._total_bytes_str)s",
                 # Retry transient network errors instead of failing immediately.
                 "--retries", "15",
                 "--fragment-retries", "15",
@@ -796,6 +946,10 @@ class VideoDownloader:
                 "--print", "before_dl:__DL__\t%(id)s\t%(playlist_index)s\t%(title)s",
                 "--print", "after_move:__DONE__\t%(id)s\t%(playlist_index)s\t%(title)s",
             ]
+            if fragment_parallel:
+                n = max(2, min(32, int(self.frag_concurrency_var.get())))
+                cmd.extend(["--concurrent-fragments", str(n)])
+                self._log(f"分片并发模式启用：{n} 个分片并发下载（一个视频的多个 HLS/DASH 分片并行）")
             # Bilibili-specific headers to avoid HTTP 412
             cmd.extend(self._bilibili_options(url))
             # YouTube needs a JS runtime for full format extraction
@@ -824,29 +978,61 @@ class VideoDownloader:
                     continue
 
                 # 1) Dedicated progress line (from --progress-template).
-                #    Format: "__PROG__  45.2%" (with optional spaces/percent sign).
+                #    Format: "__PROG__\t<percent_str>\t<speed_str>\t<eta_str>\t..."
+                #    Fallback also accepted:  "__PROG__  45.2%" (old single-field).
                 if raw.startswith("__PROG__"):
-                    m = re.search(r"([\d.]+)", raw[len("__PROG__"):])
-                    if m:
-                        pct = min(float(m.group(1)), 99.9)
-                        self.root.after(0, lambda p=pct: self.progress_var.set(p))
-                        self.root.after(0, lambda p=pct: self._set_status(f"Downloading... {p:.1f}%"))
+                    pct = None
+                    speed = ""
+                    eta = ""
+                    total = ""
+                    if "\t" in raw:
+                        parts = raw.split("\t")
+                        # parts[0]="__PROG__", parts[1]=percent, parts[2]=speed, etc.
+                        if len(parts) >= 2:
+                            m = re.search(r"([\d.]+)", parts[1])
+                            if m:
+                                pct = min(float(m.group(1)), 99.9)
+                        if len(parts) >= 3:
+                            speed = parts[2].strip()
+                        if len(parts) >= 4:
+                            eta = parts[3].strip()
+                        if len(parts) >= 6:
+                            total = parts[5].strip()
+                    else:
+                        m = re.search(r"([\d.]+)", raw[len("__PROG__"):])
+                        if m:
+                            pct = min(float(m.group(1)), 99.9)
+                    if pct is not None:
+                        self.root.after(0, lambda p=pct, sp=speed, e=eta, tot=total:
+                                        self._update_progress(p, sp, e, tot))
                         if not any_progress_seen:
-                            self.root.after(0, lambda: self._log("[progress] 收到进度条输出 ✓"))
+                            self.root.after(0, lambda: self._log("[progress] 收到进度条输出 ✓ (含速度)"))
                             any_progress_seen = True
                     continue
 
                 # 1b) Fallback progress parsing: the default [download] N% line
                 #     (in case the progress template didn't kick in for any reason).
-                m = re.search(r"\[download\]\s+([\d.]+)%", line_stripped)
+                m = re.search(r"\[download\]\s+([\d.]+)%\s+of\s+(\S+)\s+at\s+(\S+)\s+ETA\s+(\S+)", line_stripped)
                 if m:
                     pct = min(float(m.group(1)), 99.9)
-                    self.root.after(0, lambda p=pct: self.progress_var.set(p))
-                    self.root.after(0, lambda p=pct: self._set_status(f"Downloading... {p:.1f}%"))
+                    total = m.group(2).strip()
+                    speed = m.group(3).strip()
+                    eta = m.group(4).strip()
+                    self.root.after(0, lambda p=pct, sp=speed, e=eta, tot=total:
+                                    self._update_progress(p, sp, e, tot))
                     if not any_progress_seen:
                         self.root.after(0, lambda: self._log("[progress] 收到进度条输出 ✓ (from [download] line)"))
                         any_progress_seen = True
                     # Don't `continue` here — still log the progress line as usual.
+                else:
+                    # Simpler [download] fallback without speed/ETA
+                    m2 = re.search(r"\[download\]\s+([\d.]+)%", line_stripped)
+                    if m2:
+                        pct = min(float(m2.group(1)), 99.9)
+                        self.root.after(0, lambda p=pct: self._update_progress(p, "", "", ""))
+                        if not any_progress_seen:
+                            self.root.after(0, lambda: self._log("[progress] 收到进度条输出 ✓ (from [download] line, no speed)"))
+                            any_progress_seen = True
 
                 # 2) Item-started marker (TAB separated, from --print before_dl).
                 if raw.startswith("__DL__\t") or raw.startswith("__DL__ "):
@@ -951,6 +1137,367 @@ class VideoDownloader:
                 "yt-dlp not found. Please run:  pip install yt-dlp"))
         except Exception as e:
             self.root.after(0, lambda: self._on_download_error(str(e)))
+
+    # --------------------------------------------------------- multi-file
+    def _download_multi_file(self, url, fmt_id, save_dir):
+        """Download playlist videos using N parallel yt-dlp subprocesses.
+
+        Each video is handled by its own yt-dlp invocation (via
+        `--playlist-items N`), which means N videos are downloaded at the same
+        time across N yt-dlp processes.  Progress is aggregated:
+          - The progress bar = (num_done / num_total) * 100  (overall progress)
+          - Status line shows: speed aggregated across workers, done/total, and
+            active worker count.
+
+        This requires `traverse=True` — it's only useful when you have 100+
+        videos and want to use more than your per-file bandwidth cap.
+        """
+        try:
+            # 1) Rename existing files before downloading so the numbering is
+            #    consistent with new downloads.
+            self._log("Checking for previously downloaded files to rename...")
+            self._rename_existing_playlist_files(url, save_dir)
+            output_template = os.path.join(save_dir, "%(playlist_index)s.%(title)s.%(ext)s")
+
+            # If format is video-only, append best audio so yt-dlp auto-merges
+            fmt_info = next((f for f in self.formats if f[1] == fmt_id), None)
+            if fmt_info and not fmt_info[3]:  # has_audio = False
+                download_fmt = f"{fmt_id}+bestaudio/{fmt_id}"
+            else:
+                download_fmt = fmt_id
+
+            archive_path = os.path.join(save_dir, ".yt-dlp-archive.txt")
+
+            # 2) Fetch the playlist entry list (id, playlist_index, title) so
+            #    we know how many videos there are and their positions.
+            entries = self._get_playlist_entries(url)
+            if not entries:
+                self.root.after(0, lambda: self._on_download_error(
+                    "无法获取播放列表信息，多文件并行下载中止。\n请切换到顺序或分片模式重试。"))
+                return
+
+            # 3) Skip entries that are already in the archive so we don't even
+            #    spin up a yt-dlp process for them.
+            archived_ids = set()
+            try:
+                if os.path.isfile(archive_path):
+                    with open(archive_path, "r", encoding="utf-8", errors="replace") as f:
+                        for ln in f:
+                            ln = ln.strip()
+                            # archive line format: "extractor id" e.g. "youtube XYZ123"
+                            t = ln.split()
+                            if len(t) >= 2:
+                                archived_ids.add(t[1])
+            except OSError:
+                pass
+
+            pending = [e for e in entries if e[0] not in archived_ids]
+            self._overall_total_videos = len(entries)
+            self._overall_done_videos = len(entries) - len(pending)
+            if not pending:
+                self.root.after(0, self._on_download_done)
+                return
+
+            self._log(f"播放列表共 {len(entries)} 个视频，已完成 {len(entries)-len(pending)} 个，"
+                      f"待下载 {len(pending)} 个。")
+
+            concurrency = max(2, min(16, int(self.file_concurrency_var.get())))
+            self._log(f"启动多文件并行模式：同时下载 {concurrency} 个视频。")
+
+            import queue
+            import threading as _th
+
+            result_q = queue.Queue()  # (type, payload) tuples: ("log", str) / ("done", vid) / ("fail", vid, title) / ("progress", vid, pct, speed, eta)
+            workers_lock = _th.Lock()
+            workers_active = {"count": 0}
+
+            def inc_workers(delta):
+                with workers_lock:
+                    workers_active["count"] += delta
+                self._active_workers = workers_active["count"]
+
+            self._active_workers = 0
+
+            # Track per-video progress so the "overall pct" can be computed:
+            #   overall = (already_done*100 + sum(pct_of_pending_present)) / total
+            per_video_pct = {}
+            per_video_pct_lock = _th.Lock()
+
+            def overall_pct():
+                with per_video_pct_lock:
+                    pct_sum = sum(per_video_pct.values())
+                total = self._overall_total_videos or 1
+                done = self._overall_done_videos * 100
+                return min(99.9, (done + pct_sum) / total)
+
+            # --- single-video worker function (runs in its own thread) ---
+            def run_one(vid, playlist_index, title):
+                try:
+                    inc_workers(1)
+                    result_q.put(("log",
+                        f"[并行] 开始 #{playlist_index} {title}"))
+                    item_cmd = [
+                        self._get_ytdlp_cmd(),
+                        "-f", download_fmt,
+                        "--merge-output-format", "mp4",
+                        "-o", output_template,
+                        "--newline",
+                        "--no-colors",
+                        "--progress",
+                        "--progress-template",
+                        "download:__PROG__\t%(progress._percent_str)s\t"
+                        "%(progress._speed_str)s\t%(progress._eta_str)s\t"
+                        "%(progress._downloaded_bytes_str)s\t%(progress._total_bytes_str)s",
+                        "--retries", "10",
+                        "--fragment-retries", "10",
+                        "--retry-sleep", "fragment:exp=1::30",
+                        "--socket-timeout", "45",
+                        "--download-archive", archive_path,
+                        "--no-overwrites",
+                        "--continue",
+                        # Force a single playlist item — even if the URL is a
+                        # whole playlist, this yt-dlp process only handles index N.
+                        "--yes-playlist",
+                        "--playlist-items", str(playlist_index),
+                        "--print", "before_dl:__DL__\t%(id)s\t%(playlist_index)s\t%(title)s",
+                        "--print", "after_move:__DONE__\t%(id)s\t%(playlist_index)s\t%(title)s",
+                    ]
+                    item_cmd.extend(self._bilibili_options(url))
+                    item_cmd.extend(self._youtube_options(url))
+                    item_cmd.extend(self._cookies_options())
+                    item_cmd.extend(self._proxy_options())
+                    item_cmd.append(url)
+
+                    p = subprocess.Popen(item_cmd, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT,
+                                         text=True, encoding="utf-8", errors="replace")
+                    finished_ok = False
+                    last_pct = 0.0
+                    for line in p.stdout:
+                        raw = line.rstrip("\r\n").strip()
+                        if not raw:
+                            continue
+                        # progress
+                        if raw.startswith("__PROG__") and "\t" in raw:
+                            parts = raw.split("\t")
+                            pct_val = 0.0
+                            speed = ""
+                            eta = ""
+                            if len(parts) >= 2:
+                                m = re.search(r"([\d.]+)", parts[1])
+                                if m:
+                                    pct_val = min(float(m.group(1)), 99.9)
+                            if len(parts) >= 3:
+                                speed = parts[2].strip()
+                            if len(parts) >= 4:
+                                eta = parts[3].strip()
+                            last_pct = pct_val
+                            with per_video_pct_lock:
+                                per_video_pct[vid] = pct_val
+                            result_q.put(("progress", vid, pct_val, speed, eta))
+                            continue
+                        # done marker
+                        if raw.startswith("__DONE__\t"):
+                            finished_ok = True
+                            continue
+                        # Interesting lines get forwarded to the log.
+                        raw_lower = raw.lower()
+                        if any(k in raw_lower for k in ("error", "timed out",
+                                                        "forbidden", "failed",
+                                                        "http error 4",
+                                                        "http error 5",
+                                                        "has already been")):
+                            result_q.put(("log", f"[#{playlist_index}] {raw}"))
+                    p.wait()
+                    if finished_ok or (p.returncode == 0 and os.path.isfile(archive_path)):
+                        # Finalise: mark 100% and put it in the done queue.
+                        with per_video_pct_lock:
+                            per_video_pct.pop(vid, None)
+                        result_q.put(("done", vid, playlist_index, title))
+                    else:
+                        with per_video_pct_lock:
+                            per_video_pct.pop(vid, None)
+                        result_q.put(("fail", vid, playlist_index, title,
+                                      f"exit code {p.returncode}"))
+                except Exception as ex:
+                    with per_video_pct_lock:
+                        per_video_pct.pop(vid, None)
+                    result_q.put(("fail", vid, playlist_index, title, str(ex)))
+                finally:
+                    inc_workers(-1)
+
+            # 4) Start a thread pool of `concurrency` consumer threads.
+            stop_event = _th.Event()
+            # We use a queue of pending entries so workers can pop the next one.
+            pending_q = queue.Queue()
+            for e in pending:
+                pending_q.put(e)
+
+            failures = []  # (idx, title, reason)
+            all_finished = _th.Event()
+
+            def worker_thread():
+                # Each worker keeps popping from pending_q until it's empty.
+                while not stop_event.is_set():
+                    try:
+                        entry = pending_q.get_nowait()
+                    except queue.Empty:
+                        return
+                    vid, idx, title = entry
+                    try:
+                        run_one(vid, idx, title)
+                    finally:
+                        pending_q.task_done()
+
+            pool = [_th.Thread(target=worker_thread, daemon=True)
+                    for _ in range(concurrency)]
+            for t in pool:
+                t.start()
+
+            # 5) Pump the result queue on the main download thread (we're
+            #    already in a daemon thread from _start_download) and forward
+            #    updates into the Tk event loop via root.after.
+            total_pending = len(pending)
+            completed = 0
+            last_logged_progress = [0.0]
+            # Speed aggregation: keep last reading from each vid and average/sum them.
+            speed_readings = {}
+            last_speed_readings_lock = _th.Lock()
+
+            def all_workers_dead():
+                return all(not t.is_alive() for t in pool) and pending_q.empty()
+
+            while True:
+                try:
+                    item = result_q.get(timeout=0.5)
+                except queue.Empty:
+                    if all_workers_dead() and result_q.empty():
+                        break
+                    # Periodic status refresh so the bar doesn't look stuck.
+                    p = overall_pct()
+                    self.root.after(0, lambda p=p: self._update_progress(
+                        p, self._aggregate_speeds(speed_readings, last_speed_readings_lock), "", ""))
+                    continue
+
+                itype = item[0]
+                if itype == "log":
+                    msg = item[1]
+                    self.root.after(0, lambda m=msg: self._log(m))
+                elif itype == "progress":
+                    _, vid, pct_val, speed, eta = item
+                    if speed:
+                        import time
+                        with last_speed_readings_lock:
+                            speed_readings[vid] = (speed, time.time())
+                    agg = self._aggregate_speeds(speed_readings, last_speed_readings_lock)
+                    ov = overall_pct()
+                    self.root.after(0, lambda ov=ov, sp=agg, et=eta:
+                                    self._update_progress(ov, sp, et, ""))
+                elif itype == "done":
+                    _, vid, idx, title = item
+                    completed += 1
+                    self._overall_done_videos = (len(entries) - len(pending)) + completed
+                    with last_speed_readings_lock:
+                        speed_readings.pop(vid, None)
+                    msg = f"[并行] ✓ 完成 #{idx} {title}"
+                    self.root.after(0, lambda m=msg: self._log(m))
+                    ov = overall_pct()
+                    agg = self._aggregate_speeds(speed_readings, last_speed_readings_lock)
+                    self.root.after(0, lambda ov=ov, sp=agg: self._update_progress(ov, sp, "", ""))
+                elif itype == "fail":
+                    _, vid, idx, title, reason = item
+                    completed += 1
+                    # completed 不增加 done_videos，因为失败了
+                    with last_speed_readings_lock:
+                        speed_readings.pop(vid, None)
+                    failures.append((idx, title, reason))
+                    msg = f"[并行] ✗ 失败 #{idx} {title}  ({reason})"
+                    self.root.after(0, lambda m=msg: self._log(m))
+                if completed >= total_pending:
+                    # All results are in.
+                    break
+
+            # Wait for pool threads to exit (they're daemon; just be tidy).
+            stop_event.set()
+            for t in pool:
+                t.join(timeout=2)
+
+            # --- Final summary ---
+            self._active_workers = 0
+            success_count = total_pending - len(failures)
+            self.root.after(0, lambda: self._log(
+                f"[并行模式] 完成: 成功 {success_count}, 失败 {len(failures)}."))
+
+            if not failures and success_count == total_pending:
+                self.root.after(0, self._on_download_done)
+            else:
+                summary = [f"多文件并行下载完成 (成功: {success_count}, 失败: {len(failures)})."]
+                if failures:
+                    summary.append(f"失败项目 ({len(failures)}):")
+                    for idx, title, reason in failures[:30]:
+                        summary.append(f"  - #{idx} {title}  ({reason})")
+                    if len(failures) > 30:
+                        summary.append(f"  ... 还有 {len(failures) - 30} 个")
+                final_msg = "\n".join(summary)
+                self.root.after(0, lambda m=final_msg: self._on_download_partial(m))
+
+        except FileNotFoundError:
+            self.root.after(0, lambda: self._on_download_error(
+                "yt-dlp not found. Please run:  pip install yt-dlp"))
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.root.after(0, lambda: self._on_download_error(str(e)))
+
+    @staticmethod
+    def _aggregate_speeds(speed_readings, lock):
+        """Sum per-video speed strings (e.g. "2.4 MiB/s") into one total.
+
+        speed_readings: {vid: (speed_str, timestamp)} — entries older than
+        ~5 seconds are dropped so stale readings don't inflate the total.
+        Returns a human-readable string like "7.8 MiB/s", or "" if unknown.
+        """
+        import time
+        now = time.time()
+        total = 0.0  # bytes per second
+        any_valid = False
+        try:
+            with lock:
+                items = list(speed_readings.values())
+        except Exception:
+            return ""
+        for s, ts in items:
+            if now - ts > 5:
+                continue
+            if not s:
+                continue
+            # Parse "2.4 MiB/s", "300 KiB/s", "5.1 GB/s", "12 B/s" ...
+            m = re.match(r"\s*([\d.]+)\s*([KMG]?i?B|b)?/?s?", s)
+            if not m:
+                continue
+            try:
+                num = float(m.group(1))
+            except ValueError:
+                continue
+            unit = (m.group(2) or "B").upper().replace("IB", "B")
+            mul = 1.0
+            if unit.startswith("K"):
+                mul = 1024.0
+            elif unit.startswith("M"):
+                mul = 1024.0 * 1024.0
+            elif unit.startswith("G"):
+                mul = 1024.0 * 1024.0 * 1024.0
+            total += num * mul
+            any_valid = True
+        if not any_valid:
+            return ""
+        # Format back to the nicest unit.
+        for unit in ("MiB/s", "KiB/s"):
+            if unit == "MiB/s":
+                if total >= 1024 * 50:  # >= 50 KiB -> prefer MiB
+                    return f"{total / (1024*1024):.2f} MiB/s"
+                break
+        return f"{total / 1024:.1f} KiB/s" if total else ""
 
     def _on_download_partial(self, summary):
         """Called when a playlist download finishes with some failures.

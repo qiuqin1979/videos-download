@@ -10,9 +10,39 @@
 
 - **仓库地址**：https://github.com/qiuqin1979/videos-download.git
 - **分支**：main
-- **提交**：`b60d498` Initial commit
+- **提交**：`b60d498` → `a654721`
 - **包含文件**：video_download.py, start.bat, start.vbs, run.bat, export_cookies.py, requirements.txt, CHANGELOG.md, README.md, .gitignore
 - **排除文件**（.gitignore）：downloads/ 等视频目录、cookies.txt、.video_downloader_settings.json、__pycache__/、*.part 等
+
+## 2026-08-07 下载速度显示 + 两种并行下载模式
+
+### A. 下载速度显示
+- **修改**：`--progress-template` 扩展为 TAB 分隔格式，加入 `_speed_str / _eta_str / _downloaded_bytes_str / _total_bytes_str`
+- **修改**：新增 `_update_progress()` 方法统一格式化状态栏，内容：`下载中 N% | 速度 X MiB/s | 剩余 M:SS | 总量 Y MB | 视频 A/B | 并行 N`
+- **修改**：双保险解析：`__PROG__` 自定义模板 + `[download]` 旧格式回退
+- **回退**：删 `_update_progress()` 方法，恢复直接 `self.progress_var.set()` 和 `_set_status("Downloading... p%")
+
+### B. 方案 1 — 单文件分片多线程
+- **实现方式**：一个文件多个 HLS/DASH 分片并行下载（yt-dlp 内置 `--concurrent-fragments N`）
+- **使用场景**：单个视频分片多，YouTube/B站大多数视频都是 HLS/DASH 分片存储
+- **UI**：「下载加速」面板 → 选择「单文件分片多线程」→ 分片并发数 Spinbox（默认 4，范围 2-32）
+- **代码**：`_start_download` 根据模式分支，`_download_thread` 加 `--concurrent-fragments` 参数
+
+### C. 方案 2 — 多文件并行下载
+- **实现方式**：手动启动 N 个 yt-dlp 子进程，每个进程用 `--playlist-items <index>` 下载一个视频，N 个进程同时跑
+- **使用场景**：260+ 视频批量下载，已经下完要几天下不完（占 N 份带宽
+- **UI**：「下载加速」面板 → 选择「多文件并行下载」 → 并行文件数 Spinbox（默认 3，范围 2-16）
+- **前提**：必须勾选「遍历系列视频」（否则没有多个视频就没有意义并行多个文件
+- **核心代码**：新增 `_download_multi_file()` 方法 + 新增 `_aggregate_speeds()` 速度聚合
+  - 使用线程池模式，pending 里弹出下一个视频
+  - 结果队列 pump 模式汇总所有视频进度
+  - 总体进度 = (done*100 + Σpct) / total_videos
+  - 速度聚合：所有活跃 worker 的速率相加
+- **回退**：删除 `_download_multi_file` 和 `_aggregate_speeds` 方法即可
+
+### 持久化
+- 下载模式/分片并发/并行文件数三个设置保存到 JSON 配置，下次自动恢复
+- 窗口大小从 640px 加到 720px（容纳新增的下载加速面板）
 
 ---
 
