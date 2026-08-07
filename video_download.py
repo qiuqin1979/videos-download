@@ -145,7 +145,7 @@ class VideoDownloader:
                             textvariable=self.frag_concurrency_var,
                             font=("Segoe UI", 10),
                             bg=entry_bg, fg=fg, relief="flat",
-                            buttonbackground=btn_bg, buttonforeground=fg)
+                            buttonbackground=btn_bg)
         sp_frag.pack(side="left", padx=(6, 10))
         ttk.Label(self.frag_frame, text="  (默认 4，YouTube 建议 4-8，过高会触发限流)",
                   foreground="#a6adc8", font=("Segoe UI", 9)).pack(side="left")
@@ -158,7 +158,7 @@ class VideoDownloader:
                             textvariable=self.file_concurrency_var,
                             font=("Segoe UI", 10),
                             bg=entry_bg, fg=fg, relief="flat",
-                            buttonbackground=btn_bg, buttonforeground=fg)
+                            buttonbackground=btn_bg)
         sp_file.pack(side="left", padx=(6, 10))
         ttk.Label(self.multifile_frame, text="  (默认 3，同时下载 N 个视频，占 N 份带宽)",
                   foreground="#a6adc8", font=("Segoe UI", 9)).pack(side="left")
