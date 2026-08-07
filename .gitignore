@@ -1,0 +1,44 @@
+# Downloaded videos / audio
+downloads/
+new/
+News/
+podcast/
+新概念/
+*.mp4
+*.mkv
+*.webm
+*.avi
+*.mov
+*.m4a
+*.mp3
+*.opus
+*.flac
+*.part
+*.ytdl
+
+# yt-dlp state
+.yt-dlp-archive.txt
+
+# User settings (contains proxy/cookie paths)
+.video_downloader_settings.json
+
+# Cookies (sensitive)
+cookies.txt
+*.cookies
+*.netscape
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Test scripts
+test_*.py
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
